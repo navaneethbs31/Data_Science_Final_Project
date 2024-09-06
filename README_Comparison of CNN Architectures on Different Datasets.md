@@ -1,6 +1,7 @@
-#Comparison of CNN Architectures on Different Datasets
+##Comparison of CNN Architectures on Different Datasets
 
 Problem Statement
+
 The goal of this project is to compare the performance of different CNN architectures on various datasets. Specifically, we will evaluate LeNet-5, AlexNet, GoogLeNet, VGGNet, ResNet, Xception, and SENet on MNIST, FMNIST, and CIFAR-10 datasets. The comparison will be based on metrics such as loss curves, accuracy, precision, recall, and F1-score.
 
 
