@@ -1,118 +1,160 @@
-import numpy as np
 import torch
 import torch.nn as nn
 import torch.optim as optim
-from torch.utils.data import DataLoader, TensorDataset
-import matplotlib.pyplot as plt
+import random
+import numpy as np
 
+# Device configuration
+device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
-# 1. Generate Synthetic Dataset
-def generate_data(num_samples, sequence_length):
-    X = np.random.randint(1, 10, size=(num_samples, sequence_length))
-    y = np.array([x[::-1] for x in X])
-    return X, y
+# Generate dummy data
+def generate_data(num_samples, seq_len, vocab_size):
+    data = []
+    for _ in range(num_samples):
+        src = [random.randint(1, vocab_size-1) for _ in range(seq_len)]
+        tgt = src[::-1]  # Reverse the source sequence for the target
+        data.append((src, tgt))
+    return data
 
+vocab_size = 20
+seq_len = 10
+num_samples = 1000
+data = generate_data(num_samples, seq_len, vocab_size)
 
-# Parameters
-num_samples = 10000
-sequence_length = 10
-input_dim = output_dim = 10
-hidden_dim = 32
-embedding_dim = 16
+# Define dummy vocab (for demonstration purposes)
+vocab = {str(i): i for i in range(vocab_size)}
+from torch.utils.data import Dataset, DataLoader
 
-X, y = generate_data(num_samples, sequence_length)
+class Seq2SeqDataset(Dataset):
+    def __init__(self, data):
+        self.data = data
 
-# Convert to PyTorch tensors
-X_tensor = torch.tensor(X, dtype=torch.long)
-y_tensor = torch.tensor(y, dtype=torch.long)
+    def __len__(self):
+        return len(self.data)
 
-# Create DataLoader
-train_dataset = TensorDataset(X_tensor, y_tensor)
-train_loader = DataLoader(train_dataset, batch_size=64, shuffle=True)
+    def __getitem__(self, idx):
+        src, tgt = self.data[idx]
+        return torch.tensor(src, dtype=torch.long), torch.tensor(tgt, dtype=torch.long)
 
+dataset = Seq2SeqDataset(data)
+dataloader = DataLoader(dataset, batch_size=32, shuffle=True)
+class Attention(nn.Module):
+    def __init__(self, hidden_size):
+        super(Attention, self).__init__()
+        self.attn = nn.Linear(hidden_size * 2, hidden_size)
+        self.v = nn.Parameter(torch.rand(hidden_size))
 
-# 2. Implement Seq2Seq Model with Attention Mechanism
+    def forward(self, hidden, encoder_outputs):
+        max_len = encoder_outputs.size(1)
+        H = hidden.repeat(max_len, 1, 1).transpose(0, 1)
+        attn_energies = self.score(H, encoder_outputs)
+        return torch.softmax(attn_energies, dim=1).unsqueeze(1)
+
+    def score(self, hidden, encoder_outputs):
+        energy = torch.tanh(self.attn(torch.cat([hidden, encoder_outputs], 2)))
+        energy = energy.transpose(1, 2)
+        v = self.v.repeat(encoder_outputs.size(0), 1).unsqueeze(1)
+        energy = torch.bmm(v, energy)
+        return energy.squeeze(1)
+
+class Encoder(nn.Module):
+    def __init__(self, input_size, embed_size, hidden_size, num_layers):
+        super(Encoder, self).__init__()
+        self.embedding = nn.Embedding(input_size, embed_size)
+        self.lstm = nn.LSTM(embed_size, hidden_size, num_layers, batch_first=True)
+
+    def forward(self, x):
+        embedding = self.embedding(x)
+        outputs, (hidden, cell) = self.lstm(embedding)
+        return outputs, hidden, cell
+
+class Decoder(nn.Module):
+    def __init__(self, output_size, embed_size, hidden_size, num_layers, attention):
+        super(Decoder, self).__init__()
+        self.output_size = output_size
+        self.attention = attention
+        self.embedding = nn.Embedding(output_size, embed_size)
+        self.lstm = nn.LSTM(hidden_size + embed_size, hidden_size, num_layers, batch_first=True)
+        self.fc = nn.Linear(hidden_size, output_size)
+
+    def forward(self, x, hidden, cell, encoder_outputs):
+        x = x.unsqueeze(1)
+        embedding = self.embedding(x)
+        attn_weights = self.attention(hidden[-1], encoder_outputs)
+        context = attn_weights.bmm(encoder_outputs)
+        rnn_input = torch.cat((embedding, context), dim=2)
+        outputs, (hidden, cell) = self.lstm(rnn_input, (hidden, cell))
+        predictions = self.fc(outputs.squeeze(1))
+        return predictions, hidden, cell
+
 class Seq2Seq(nn.Module):
-    def __init__(self, input_dim, output_dim, hidden_dim, embedding_dim):
+    def __init__(self, encoder, decoder):
         super(Seq2Seq, self).__init__()
-        self.embedding = nn.Embedding(input_dim, embedding_dim)
-        self.encoder_lstm = nn.LSTM(embedding_dim, hidden_dim, batch_first=True)
-        self.decoder_lstm = nn.LSTM(embedding_dim, hidden_dim, batch_first=True)
-        self.attention = nn.Linear(hidden_dim, hidden_dim)
-        self.fc = nn.Linear(hidden_dim, output_dim)
+        self.encoder = encoder
+        self.decoder = decoder
 
-    def forward(self, src, trg):
-        src_embedded = self.embedding(src)
-        trg_embedded = self.embedding(trg)
+    def forward(self, source, target, teacher_forcing_ratio=0.5):
+        batch_size = source.shape[0]
+        target_len = target.shape[1]
+        target_vocab_size = self.decoder.output_size
 
-        encoder_outputs, (hidden, cell) = self.encoder_lstm(src_embedded)
+        outputs = torch.zeros(batch_size, target_len, target_vocab_size).to(device)
 
-        attention_weights = torch.bmm(trg_embedded, encoder_outputs.transpose(1, 2))
-        attention_weights = torch.nn.functional.softmax(attention_weights, dim=2)
+        encoder_outputs, hidden, cell = self.encoder(source)
 
-        context = torch.bmm(attention_weights, encoder_outputs)
+        x = target[:, 0]
 
-        decoder_input = torch.cat((trg_embedded, context), dim=2)
-        decoder_outputs, _ = self.decoder_lstm(decoder_input, (hidden, cell))
+        for t in range(1, target_len):
+            output, hidden, cell = self.decoder(x, hidden, cell, encoder_outputs)
+            outputs[:, t, :] = output
+            best_guess = output.argmax(1)
+            x = target[:, t] if random.random() < teacher_forcing_ratio else best_guess
 
-        output = self.fc(decoder_outputs)
-        return output
+        return outputs
 
+# Initialize the model
+input_size = vocab_size
+output_size = vocab_size
+embed_size = 256
+hidden_size = 512
+num_layers = 2
 
-# Instantiate model, loss function, and optimizer
-model = Seq2Seq(input_dim, output_dim, hidden_dim, embedding_dim)
+attention = Attention(hidden_size)
+encoder = Encoder(input_size, embed_size, hidden_size, num_layers).to(device)
+decoder = Decoder(output_size, embed_size, hidden_size, num_layers, attention).to(device)
+model = Seq2Seq(encoder, decoder).to(device)
+
+# Loss and optimizer
 criterion = nn.CrossEntropyLoss()
 optimizer = optim.Adam(model.parameters(), lr=0.001)
-
-
-# 3. Train the Model
-def train_model(model, train_loader, criterion, optimizer, epochs=10):
+num_epochs = 10
+for epoch in range(num_epochs):
     model.train()
-    loss_history = []
-    for epoch in range(epochs):
-        total_loss = 0
-        for src, trg in train_loader:
-            optimizer.zero_grad()
-            output = model(src, trg)
-            loss = criterion(output.view(-1, output_dim), trg.view(-1))
-            loss.backward()
-            optimizer.step()
-            total_loss += loss.item()
-        avg_loss = total_loss / len(train_loader)
-        loss_history.append(avg_loss)
-        print(f'Epoch {epoch + 1}/{epochs}, Loss: {avg_loss}')
-    return loss_history
+    for i, (src, tgt) in enumerate(dataloader):
+        src, tgt = src.to(device), tgt.to(device)
 
+        optimizer.zero_grad()
+        output = model(src, tgt)
 
-loss_history = train_model(model, train_loader, criterion, optimizer)
+        output = output[:, 1:].reshape(-1, output.shape[2])
+        tgt = tgt[:, 1:].reshape(-1)
 
+        loss = criterion(output, tgt)
+        loss.backward()
+        optimizer.step()
 
-# 4. Evaluate the Model
-def evaluate_model(model, data_loader):
-    model.eval()
-    total_loss = 0
-    with torch.no_grad():
-        for src, trg in data_loader:
-            output = model(src, trg)
-            loss = criterion(output.view(-1, output_dim), trg.view(-1))
-            total_loss += loss.item()
-    return total_loss / len(data_loader)
+    print(f'Epoch [{epoch+1}/{num_epochs}], Loss: {loss.item():.4f}')
+model.eval()
+with torch.no_grad():
+    for i, (src, tgt) in enumerate(dataloader):
+        src, tgt = src.to(device), tgt.to(device)
 
+        output = model(src, tgt, teacher_forcing_ratio=0)
+        output = output[:, 1:].reshape(-1, output.shape[2])
+        tgt = tgt[:, 1:].reshape(-1)
 
-test_loader = DataLoader(train_dataset, batch_size=64, shuffle=False)
-test_loss = evaluate_model(model, test_loader)
-print(f'Test Loss: {test_loss}')
-
-
-# 5. Plot Loss Curves
-def plot_loss_curve(losses, title="Loss Curve"):
-    plt.figure()
-    plt.plot(losses, label="Loss")
-    plt.xlabel("Epoch")
-    plt.ylabel("Loss")
-    plt.title(title)
-    plt.legend()
-    plt.show()
-
-
-plot_loss_curve(loss_history)
+        pred = output.argmax(1).view(-1, seq_len-1)
+        print(f'Source: {src[0].cpu().numpy()}')
+        print(f'Target: {tgt.view(-1, seq_len-1)[0].cpu().numpy()}')
+        print(f'Predicted: {pred[0].cpu().numpy()}')
+        break
